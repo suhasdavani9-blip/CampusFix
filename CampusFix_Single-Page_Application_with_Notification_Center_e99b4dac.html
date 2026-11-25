@@ -1,0 +1,1338 @@
+<!DOCTYPE html>
+<html lang="en" class="h-full">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <title>CampusFix — Smart Campus Problem Reporting System</title>
+    
+    <!-- Tailwind CSS CDN -->
+    <script src="https://cdn.tailwindcss.com"></script>
+    <!-- Inter Font & FontAwesome Icons -->
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+    
+    <script>
+        tailwind.config = {
+            theme: {
+                extend: {
+                    fontFamily: {
+                        sans: ['Inter', 'sans-serif'],
+                    },
+                    colors: {
+                        campus: {
+                            50: '#f0fdf4',
+                            100: '#dcfce7',
+                            500: '#22c55e',
+                            600: '#16a34a',
+                            700: '#15803d',
+                            800: '#166534',
+                            900: '#14532d',
+                        },
+                        darkslate: {
+                            800: '#1e293b',
+                            900: '#0f172a',
+                        }
+                    }
+                }
+            }
+        }
+    </script>
+    <style>
+        body {
+            font-family: 'Inter', sans-serif;
+            -webkit-tap-highlight-color: transparent;
+        }
+        .fade-in {
+            animation: fadeIn 0.25s ease-in-out forwards;
+        }
+        @keyframes fadeIn {
+            from { opacity: 0; transform: translateY(4px); }
+            to { opacity: 1; transform: translateY(0); }
+        }
+        ::-webkit-scrollbar {
+            width: 6px;
+            height: 6px;
+        }
+        ::-webkit-scrollbar-track {
+            background: #f1f5f9;
+        }
+        ::-webkit-scrollbar-thumb {
+            background: #cbd5e1;
+            border-radius: 3px;
+        }
+    </style>
+</head>
+<body class="bg-slate-50 text-slate-800 h-full flex flex-col antialiased">
+
+    <!-- Firebase SDK Imports -->
+    <script type="module">
+        import { initializeApp } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-app.js";
+        import { getAuth, signInAnonymously, signInWithCustomToken, onAuthStateChanged } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-auth.js";
+        import { getFirestore, collection, doc, getDoc, setDoc, addDoc, updateDoc, deleteDoc, onSnapshot, query, orderBy, limit } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js";
+
+        const appId = typeof __app_id !== 'undefined' ? __app_id : 'campusfix-demo-app';
+        const firebaseConfig = typeof __firebase_config !== 'undefined' ? JSON.parse(__firebase_config) : {
+            apiKey: "AIzaSyDVD7uN7BK-s8ILpAvFIujtWKWoeV9sPfw",
+            authDomain: "teak-tiger-3pz3c.firebaseapp.com",
+            projectId: "teak-tiger-3pz3c",
+            firestoreDatabaseId: "ai-studio-campusfixsmartca-d8b4bccf-0946-4c0f-880b-2aaf5af7d8a6",
+            storageBucket: "teak-tiger-3pz3c.firebasestorage.app",
+            messagingSenderId: "195198362611",
+            appId: "1:195198362611:web:43566d793ec106c81a2886"
+        };
+
+        let app, db, auth;
+        let currentUser = null;
+        let reportsCache = [];
+        let notificationsCache = [];
+        let currentTab = 'home';
+        let isAdminLoggedIn = false;
+        let adminPasscode = "S0309";
+        window.adminPasscode = adminPasscode;
+        let activeFcmToken = null;
+        let activeTargetComplaintId = null;
+
+        // Admin preferences
+        let adminPrefs = {
+            newComplaints: true,
+            urgentComplaints: true,
+            unresolvedComplaints: true
+        };
+
+        // Initialize Firebase
+        try {
+            app = initializeApp(firebaseConfig);
+            db = getFirestore(app, firebaseConfig.firestoreDatabaseId);
+            auth = getAuth(app);
+
+            const initAuth = async () => {
+                try {
+                    if (typeof __initial_auth_token !== 'undefined' && __initial_auth_token) {
+                        await signInWithCustomToken(auth, __initial_auth_token);
+                    } else {
+                        await signInAnonymously(auth);
+                    }
+                } catch (err) {
+                    await signInAnonymously(auth);
+                }
+            };
+
+            onAuthStateChanged(auth, (user) => {
+                if (user) {
+                    currentUser = user;
+                    if (activeFcmToken) registerDeviceToken(activeFcmToken);
+                } else {
+                    currentUser = null;
+                }
+            });
+
+            initAuth();
+            setupFirestoreListener();
+            setupNotificationsListener();
+        } catch (e) {
+            console.error("Firebase init fallback:", e);
+            loadMockData();
+        }
+
+        // Native Android Bridge Interface Callbacks
+        window.onNativeTokenRefresh = function(token) {
+            console.log("Native FCM Token received:", token);
+            activeFcmToken = token;
+            // Every device (student, staff, admin) registers so it can receive push alerts
+            registerDeviceToken(token);
+        };
+
+        window.onNativeNotificationOpened = function(complaintId) {
+            console.log("App opened from native notification for complaint:", complaintId);
+            activeTargetComplaintId = complaintId;
+            window.appState.setTab('view');
+            setTimeout(() => {
+                highlightComplaintCard(complaintId);
+            }, 300);
+        };
+
+        // Saves this device's FCM token. role = 'admin' or 'user'.
+        // Users get updates on their own complaints; admins also get new/urgent/unresolved alerts.
+        function registerDeviceToken(token) {
+            if (!db || !currentUser || !token) return;
+            try {
+                const tokenRef = doc(db, 'artifacts', appId, 'public', 'data', 'device_tokens', token);
+                setDoc(tokenRef, {
+                    token: token,
+                    uid: currentUser.uid,
+                    role: isAdminLoggedIn ? 'admin' : 'user',
+                    preferences: adminPrefs,
+                    updatedAt: new Date().toISOString()
+                }, { merge: true });
+            } catch (err) {
+                console.error("Token registration error:", err);
+            }
+        }
+
+        function playChime(isUrgent = false) {
+            try {
+                const AudioCtx = window.AudioContext || window.webkitAudioContext;
+                if (!AudioCtx) return;
+                const ctx = new AudioCtx();
+                const now = ctx.currentTime;
+                const osc = ctx.createOscillator();
+                const gain = ctx.createGain();
+                osc.type = 'sine';
+                if (isUrgent) {
+                    osc.frequency.setValueAtTime(659.25, now);
+                    osc.frequency.exponentialRampToValueAtTime(880.0, now + 0.1);
+                    osc.frequency.setValueAtTime(880.0, now + 0.15);
+                    osc.frequency.exponentialRampToValueAtTime(1046.5, now + 0.28);
+                    gain.gain.setValueAtTime(0.25, now);
+                    gain.gain.exponentialRampToValueAtTime(0.001, now + 0.35);
+                    osc.connect(gain);
+                    gain.connect(ctx.destination);
+                    osc.start(now);
+                    osc.stop(now + 0.36);
+                } else {
+                    osc.frequency.setValueAtTime(523.25, now);
+                    osc.frequency.exponentialRampToValueAtTime(783.99, now + 0.12);
+                    gain.gain.setValueAtTime(0.2, now);
+                    gain.gain.exponentialRampToValueAtTime(0.001, now + 0.28);
+                    osc.connect(gain);
+                    gain.connect(ctx.destination);
+                    osc.start(now);
+                    osc.stop(now + 0.3);
+                }
+            } catch(e) {}
+        }
+
+        window.requestWebPushPermission = async function() {
+            if ('Notification' in window) {
+                try {
+                    const perm = await Notification.requestPermission();
+                    if (perm === 'granted') {
+                        playChime(false);
+                        window.showBrowserNotification("🔔 Push Notifications Active", "You will receive real-time alerts when new complaints are filed.");
+                        showToast("Push notifications enabled!", "success");
+                    } else {
+                        showToast("Push notifications were denied.", "error");
+                    }
+                } catch(e) {}
+            } else {
+                showToast("Push notifications are not supported by this browser.", "error");
+            }
+        };
+
+        window.showBrowserNotification = function(title, body, complaintId) {
+            playChime(title.includes('Urgent'));
+            if ('Notification' in window && Notification.permission === 'granted') {
+                try {
+                    const notif = new Notification(title, {
+                        body: body,
+                        icon: '/favicon.ico',
+                        tag: complaintId || 'campusfix-alert'
+                    });
+                    notif.onclick = function() {
+                        window.focus();
+                        if (complaintId) {
+                            window.appState.setTab('view');
+                            setTimeout(() => highlightComplaintCard(complaintId), 300);
+                        }
+                    };
+                } catch(e) {}
+            }
+        };
+
+        let initialHtmlLoadDone = false;
+        function setupFirestoreListener() {
+            if (!db) return;
+            try {
+                const reportsRef = collection(db, 'reports');
+                onSnapshot(reportsRef, (snapshot) => {
+                    const loadedReports = [];
+                    snapshot.forEach((docSnap) => {
+                        loadedReports.push({ firebaseDocId: docSnap.id, ...docSnap.data() });
+                    });
+                    loadedReports.sort((a, b) => new Date(b.createdAt || 0) - new Date(a.createdAt || 0));
+
+                    if (initialHtmlLoadDone) {
+                        snapshot.docChanges().forEach((change) => {
+                            const d = change.doc.data();
+                            if (change.type === 'added') {
+                                const title = d.priority === 'High' ? '🚨 URGENT: ' + d.category : '📢 New Report: ' + d.category;
+                                const body = `${d.location || 'Campus'} — ${(d.description || '').substring(0, 75)}`;
+                                window.showBrowserNotification(title, body, d.id);
+                            } else if (change.type === 'modified') {
+                                window.showBrowserNotification('📋 Ticket Updated: ' + (d.id || 'Report'), `${d.category || 'Complaint'} status changed to ${d.status}`, d.id);
+                            }
+                        });
+                    }
+                    initialHtmlLoadDone = true;
+
+                    reportsCache = loadedReports;
+                    updateUIState();
+                }, (error) => {
+                    console.error("Firestore sync error:", error);
+                });
+            } catch (err) {
+                console.error("Firestore listener err:", err);
+            }
+        }
+
+        function setupNotificationsListener() {
+            if (!db) return;
+            try {
+                const notifRef = collection(db, 'notifications');
+                onSnapshot(notifRef, (snapshot) => {
+                    const loadedNotifs = [];
+                    snapshot.forEach((docSnap) => {
+                        loadedNotifs.push({ firebaseDocId: docSnap.id, ...docSnap.data() });
+                    });
+                    loadedNotifs.sort((a, b) => new Date(b.createdAt || 0) - new Date(a.createdAt || 0));
+                    notificationsCache = loadedNotifs;
+                    updateNotificationUI();
+                });
+            } catch (err) {
+                console.warn("Notifications Firestore listener unavailable.");
+            }
+        }
+
+        function loadMockData() {
+            reportsCache = [];
+            notificationsCache = [];
+            updateUIState();
+        }
+
+        function highlightComplaintCard(complaintId) {
+            const el = document.getElementById(`card-${complaintId}`);
+            if (el) {
+                el.scrollIntoView({ behavior: 'smooth', block: 'center' });
+                el.classList.add('ring-4', 'ring-campus-500', 'transition-all');
+                setTimeout(() => el.classList.remove('ring-4', 'ring-campus-500'), 3000);
+            }
+        }
+
+        window.appState = {
+            getReports: () => reportsCache,
+            getNotifications: () => notificationsCache,
+            getCurrentTab: () => currentTab,
+            setTab: (tab) => { currentTab = tab; updateUIState(); window.scrollTo(0, 0); },
+            isAdmin: () => isAdminLoggedIn,
+            setAdmin: (status) => { 
+                isAdminLoggedIn = status; 
+                if (activeFcmToken) {
+                    registerDeviceToken(activeFcmToken); // updates role (admin/user)
+                }
+                updateUIState(); 
+            },
+            getAdminPrefs: () => adminPrefs,
+            updateAdminPrefs: (newPrefs) => {
+                adminPrefs = { ...adminPrefs, ...newPrefs };
+                if (isAdminLoggedIn && activeFcmToken) {
+                    registerDeviceToken(activeFcmToken);
+                }
+                showToast("Notification preferences updated.", "success");
+            },
+            submitReport: async (reportData) => {
+                const uniqueId = 'CF-' + Math.floor(1000 + Math.random() * 9000);
+                const fullReport = {
+                    id: uniqueId,
+                    ...reportData,
+                    reporterUid: currentUser ? currentUser.uid : null, // lets us push status updates to the reporter
+                    status: 'Reported',
+                    createdAt: new Date().toISOString()
+                };
+
+                if (db) {
+                    try {
+                        const reportsRef = collection(db, 'reports');
+                        await addDoc(reportsRef, fullReport);
+
+                        // Save in-app notification record
+                        const notifRef = collection(db, 'notifications');
+                        await addDoc(notifRef, {
+                            complaintId: uniqueId,
+                            title: reportData.priority === 'High' ? '⚠️ Urgent Complaint' : 'New CampusFix Complaint',
+                            message: `New ${reportData.category} at ${reportData.location}`,
+                            category: reportData.category,
+                            priority: reportData.priority,
+                            read: false,
+                            createdAt: new Date().toISOString()
+                        });
+
+                        showToast("Report submitted successfully! ID: " + uniqueId, "success");
+                        return true;
+                    } catch (e) {
+                        console.error("Firestore addDoc error:", e);
+                        showToast("Failed to save report to database.", "error");
+                        return false;
+                    }
+                } else {
+                    reportsCache.unshift(fullReport);
+                    notificationsCache.unshift({
+                        firebaseDocId: 'local-' + Date.now(),
+                        complaintId: uniqueId,
+                        title: 'New CampusFix Complaint',
+                        message: `New ${reportData.category} at ${reportData.location}`,
+                        category: reportData.category,
+                        priority: reportData.priority,
+                        read: false,
+                        createdAt: new Date().toISOString()
+                    });
+                    showToast("Report submitted successfully! ID: " + uniqueId, "success");
+                    updateUIState();
+                    updateNotificationUI();
+                    return true;
+                }
+            },
+            updateStatus: async (docId, newStatus) => {
+                if (db) {
+                    try {
+                        const target = reportsCache.find(r => r.id === docId);
+                        if (target && target.firebaseDocId) {
+                            const docRef = doc(db, 'reports', target.firebaseDocId);
+                            await updateDoc(docRef, { status: newStatus });
+                        }
+                        showToast("Status updated to " + newStatus, "success");
+                    } catch (e) {
+                        const r = reportsCache.find(x => x.id === docId);
+                        if(r) r.status = newStatus;
+                        updateUIState();
+                        showToast("Status updated locally.", "success");
+                    }
+                } else {
+                    const r = reportsCache.find(x => x.id === docId);
+                    if (r) r.status = newStatus;
+                    updateUIState();
+                    showToast("Status updated to " + newStatus, "success");
+                }
+            },
+            deleteReport: async (docId) => {
+                if (db) {
+                    try {
+                        const target = reportsCache.find(r => r.id === docId);
+                        if (target && target.firebaseDocId) {
+                            const docRef = doc(db, 'reports', target.firebaseDocId);
+                            await deleteDoc(docRef);
+                        }
+                        showToast("Report deleted successfully.", "success");
+                    } catch (e) {
+                        reportsCache = reportsCache.filter(r => r.id !== docId);
+                        updateUIState();
+                        showToast("Report removed.", "success");
+                    }
+                } else {
+                    reportsCache = reportsCache.filter(r => r.id !== docId);
+                    updateUIState();
+                    showToast("Report deleted successfully.", "success");
+                }
+            },
+            markNotifRead: async (notifDocId) => {
+                if (db) {
+                    try {
+                        const notifRef = doc(db, 'notifications', notifDocId);
+                        await updateDoc(notifRef, { read: true });
+                    } catch(e) {}
+                } else {
+                    const n = notificationsCache.find(x => x.firebaseDocId === notifDocId);
+                    if (n) n.read = true;
+                    updateNotificationUI();
+                }
+            },
+            markAllNotifsRead: async () => {
+                if (db) {
+                    const unread = notificationsCache.filter(n => !n.read);
+                    for (let item of unread) {
+                        if (item.firebaseDocId) {
+                            const ref = doc(db, 'notifications', item.firebaseDocId);
+                            updateDoc(ref, { read: true }).catch(() => {});
+                        }
+                    }
+                } else {
+                    notificationsCache.forEach(n => n.read = true);
+                    updateNotificationUI();
+                }
+            }
+        };
+    </script>
+
+    <!-- Top Header Bar -->
+    <header class="bg-darkslate-900 text-white shadow-md sticky top-0 z-50">
+        <div class="max-w-4xl mx-auto px-4 py-3 flex items-center justify-between">
+            <div class="flex items-center space-x-3 cursor-pointer" onclick="window.appState.setTab('home')">
+                <div class="w-10 h-10 rounded-xl bg-campus-500 flex items-center justify-center text-white shadow-lg">
+                    <i class="fa-solid fa-hard-hat text-xl"></i>
+                </div>
+                <div>
+                    <h1 class="font-bold text-base tracking-tight flex items-center gap-2">
+                        CampusFix <span class="text-[10px] bg-campus-600 text-white px-2 py-0.5 rounded-full font-medium">Civil App</span>
+                    </h1>
+                    <p class="text-[11px] text-slate-400">Smart Problem Reporter</p>
+                </div>
+            </div>
+            <div class="flex items-center space-x-2">
+                <!-- Admin Bell & Notification Center -->
+                <div class="relative">
+                    <button onclick="toggleNotificationPanel()" class="text-xs bg-slate-800 hover:bg-slate-700 text-slate-300 p-2.5 rounded-lg border border-slate-700 transition relative" title="Notifications">
+                        <i class="fa-solid fa-bell text-sm"></i>
+                        <span id="unreadBadge" class="hidden absolute -top-1 -right-1 bg-red-500 text-white text-[9px] font-bold w-4 h-4 rounded-full flex items-center justify-center border-2 border-darkslate-900">0</span>
+                    </button>
+
+                    <!-- Notifications Dropdown Box -->
+                    <div id="notifPanel" class="hidden absolute right-0 mt-2 w-80 sm:w-96 bg-white text-slate-800 rounded-2xl shadow-2xl border border-slate-200 z-50 fade-in overflow-hidden">
+                        <div class="p-3 bg-slate-900 text-white flex items-center justify-between">
+                            <span class="font-bold text-xs flex items-center gap-2">
+                                <i class="fa-solid fa-bell text-campus-500"></i> Notification Center
+                            </span>
+                            <div class="flex items-center gap-2">
+                                <button onclick="window.requestWebPushPermission()" class="text-[10px] bg-campus-600 hover:bg-campus-700 text-white px-2 py-0.5 rounded font-medium transition flex items-center gap-1">
+                                    <i class="fa-solid fa-bullhorn text-[9px]"></i> Push
+                                </button>
+                                <button onclick="window.appState.markAllNotifsRead()" class="text-[11px] text-campus-400 hover:underline">Mark All Read</button>
+                            </div>
+                        </div>
+                        <div class="px-3 py-2 bg-slate-50 border-b border-slate-200 text-xs flex items-center justify-between">
+                            <div class="flex items-center gap-1.5 text-slate-600">
+                                <i class="fa-solid fa-tower-broadcast text-campus-600 text-xs"></i>
+                                <span class="text-[11px]">Browser Alerts: <strong><span id="pushStatusBadge">Checking...</span></strong></span>
+                            </div>
+                            <button onclick="window.requestWebPushPermission()" id="pushEnableBtn" class="text-[11px] text-campus-700 font-semibold hover:underline">
+                                Turn On
+                            </button>
+                        </div>
+                        <div id="notifListContainer" class="max-h-80 overflow-y-auto divide-y divide-slate-100">
+                            <!-- Items dynamically injected -->
+                        </div>
+                    </div>
+                </div>
+
+                <button onclick="openPrivacyModal()" class="text-xs bg-slate-800 hover:bg-slate-700 text-slate-300 px-2.5 py-2 rounded-lg border border-slate-700 transition" title="Privacy Policy">
+                    <i class="fa-solid fa-shield-cat"></i> <span class="hidden sm:inline">Privacy</span>
+                </button>
+                <button onclick="openAdminModal()" class="text-xs bg-slate-800 hover:bg-slate-700 text-slate-200 px-3 py-2 rounded-lg border border-slate-700 flex items-center gap-1.5 transition">
+                    <i class="fa-solid fa-shield-halved text-campus-500"></i>
+                    <span id="adminBtnLabel">Admin</span>
+                </button>
+            </div>
+        </div>
+    </header>
+
+    <!-- Main Scrollable Content Area -->
+    <main class="flex-1 max-w-4xl w-full mx-auto p-4 pb-28 overflow-y-auto">
+        <div id="appView" class="fade-in">
+            <!-- Dynamic view injected here -->
+        </div>
+    </main>
+
+    <!-- Bottom Navigation Bar -->
+    <nav class="bg-white border-t border-slate-200 fixed bottom-0 left-0 right-0 z-40 shadow-lg">
+        <div class="max-w-4xl mx-auto flex justify-around py-2 px-1">
+            <button onclick="window.appState.setTab('home')" id="nav-home" class="flex flex-col items-center py-1 px-3 rounded-xl text-slate-600 hover:text-campus-600 transition">
+                <i class="fa-solid fa-house text-lg"></i>
+                <span class="text-[11px] font-medium mt-1">Home</span>
+            </button>
+            <button onclick="window.appState.setTab('report')" id="nav-report" class="flex flex-col items-center py-1 px-3 rounded-xl text-slate-600 hover:text-campus-600 transition">
+                <i class="fa-solid fa-circle-plus text-lg text-campus-600"></i>
+                <span class="text-[11px] font-medium mt-1">Report</span>
+            </button>
+            <button onclick="window.appState.setTab('view')" id="nav-view" class="flex flex-col items-center py-1 px-3 rounded-xl text-slate-600 hover:text-campus-600 transition">
+                <i class="fa-solid fa-list-check text-lg"></i>
+                <span class="text-[11px] font-medium mt-1">Reports</span>
+            </button>
+            <button onclick="window.appState.setTab('dashboard')" id="nav-dashboard" class="flex flex-col items-center py-1 px-3 rounded-xl text-slate-600 hover:text-campus-600 transition">
+                <i class="fa-solid fa-chart-pie text-lg"></i>
+                <span class="text-[11px] font-medium mt-1">Dashboard</span>
+            </button>
+        </div>
+    </nav>
+
+    <!-- Admin Login & Settings Modal -->
+    <div id="adminModal" class="fixed inset-0 bg-black/60 z-50 hidden flex items-center justify-center p-4">
+        <div class="bg-white rounded-2xl max-w-md w-full p-6 shadow-2xl fade-in">
+            <div class="flex justify-between items-center mb-4">
+                <h3 class="text-lg font-bold text-slate-800 flex items-center gap-2">
+                    <i class="fa-solid fa-user-shield text-campus-600"></i> Administrator Portal
+                </h3>
+                <button onclick="closeAdminModal()" class="text-slate-400 hover:text-slate-600 p-1">
+                    <i class="fa-solid fa-xmark text-lg"></i>
+                </button>
+            </div>
+            <div id="adminModalBody"></div>
+        </div>
+    </div>
+
+    <!-- Privacy Policy Modal -->
+    <div id="privacyModal" class="fixed inset-0 bg-black/60 z-50 hidden flex items-center justify-center p-4">
+        <div class="bg-white rounded-3xl max-w-lg w-full p-6 shadow-2xl fade-in space-y-4 max-h-[85vh] flex flex-col">
+            <div class="flex justify-between items-center pb-2 border-b border-slate-100">
+                <h3 class="text-lg font-bold text-slate-800 flex items-center gap-2">
+                    <i class="fa-solid fa-user-shield text-campus-600"></i> Privacy Policy
+                </h3>
+                <button onclick="closePrivacyModal()" class="text-slate-400 hover:text-slate-600 p-1">
+                    <i class="fa-solid fa-xmark text-lg"></i>
+                </button>
+            </div>
+            <div class="overflow-y-auto space-y-3 text-xs text-slate-600 leading-relaxed pr-1">
+                <p><strong>Effective Date:</strong> October 2026</p>
+                <p><strong>CampusFix</strong> is dedicated to protecting user privacy while facilitating civil engineering problem reporting across campus.</p>
+
+                <h4 class="font-bold text-slate-800 text-sm">1. Data Collected</h4>
+                <p>We collect details related to reported infrastructure issues, including problem categories, photos, priority levels, and location descriptions.</p>
+
+                <h4 class="font-bold text-slate-800 text-sm">2. Purpose of Collection</h4>
+                <p>The collected data is used exclusively by campus maintenance teams and civil engineering authorities to identify, prioritize, and repair facility defects.</p>
+
+                <h4 class="font-bold text-slate-800 text-sm">3. Data Sharing & Security</h4>
+                <p>Your reports are stored securely in Google Cloud Firestore. No personal data is sold or shared with external third-party advertisers.</p>
+
+                <div class="bg-slate-50 p-3 rounded-xl border border-slate-200 mt-2">
+                    <p class="font-semibold text-slate-700 mb-1">Direct Privacy URL for Google Play / Stores:</p>
+                    <code id="privacyUrlText" class="block bg-white p-2 rounded border border-slate-200 text-[11px] font-mono text-campus-700 break-all select-all">https://campusfix-demo.web.app/privacy</code>
+                    <button onclick="copyPrivacyUrl()" class="mt-2 text-xs bg-campus-600 text-white px-3 py-1.5 rounded-lg font-semibold hover:bg-campus-700 transition flex items-center gap-1">
+                        <i class="fa-regular fa-copy"></i> Copy Privacy Policy URL
+                    </button>
+                </div>
+            </div>
+            <button onclick="closePrivacyModal()" class="w-full bg-slate-900 text-white font-bold py-3 rounded-xl shadow-md transition mt-2">
+                Close Policy
+            </button>
+        </div>
+    </div>
+
+    <!-- Fullscreen Photo Modal -->
+    <div id="photoModal" class="fixed inset-0 bg-black/90 z-50 hidden flex items-center justify-center p-4" onclick="closePhotoModal()">
+        <img id="modalImageSrc" src="" class="max-w-full max-h-[85vh] rounded-xl shadow-2xl object-contain">
+    </div>
+
+    <!-- Toast Notification Container -->
+    <div id="toastContainer" class="fixed top-16 right-4 z-50 flex flex-col gap-2 pointer-events-none"></div>
+
+    <script>
+        const categories = [
+            "Damaged roads and pathways",
+            "Water leakage",
+            "Blocked drainage",
+            "Rainwater waterlogging",
+            "Overflowing dustbins",
+            "Broken lights",
+            "Damaged walls and buildings",
+            "Washroom maintenance",
+            "Other problems"
+        ];
+
+        function toggleNotificationPanel() {
+            const panel = document.getElementById('notifPanel');
+            panel.classList.toggle('hidden');
+        }
+
+        function updateNotificationUI() {
+            const notifs = window.appState.getNotifications();
+            const unreadCount = notifs.filter(n => !n.read).length;
+            const badge = document.getElementById('unreadBadge');
+
+            if (unreadCount > 0) {
+                badge.innerText = unreadCount;
+                badge.classList.remove('hidden');
+            } else {
+                badge.classList.add('hidden');
+            }
+
+            const pushBadge = document.getElementById('pushStatusBadge');
+            const pushBtn = document.getElementById('pushEnableBtn');
+            if (pushBadge) {
+                if (!('Notification' in window)) {
+                    pushBadge.innerText = 'Unsupported';
+                    if (pushBtn) pushBtn.style.display = 'none';
+                } else if (Notification.permission === 'granted') {
+                    pushBadge.innerText = 'Active (Sound On)';
+                    pushBadge.className = 'text-green-600 font-bold';
+                    if (pushBtn) {
+                        pushBtn.innerText = 'Test Chime';
+                        pushBtn.onclick = () => {
+                            window.showBrowserNotification("🔔 CampusFix Sound Test", "Notification audio and alerts are working properly!");
+                        };
+                    }
+                } else if (Notification.permission === 'denied') {
+                    pushBadge.innerText = 'Blocked in Browser';
+                    pushBadge.className = 'text-red-500 font-semibold';
+                    if (pushBtn) pushBtn.innerText = 'Denied';
+                } else {
+                    pushBadge.innerText = 'Off';
+                    if (pushBtn) pushBtn.innerText = 'Turn On';
+                }
+            }
+
+            const list = document.getElementById('notifListContainer');
+            if (!list) return;
+
+            if (notifs.length === 0) {
+                list.innerHTML = `<p class="p-4 text-xs text-slate-400 text-center">No notifications yet.</p>`;
+                return;
+            }
+
+            list.innerHTML = notifs.map(n => `
+                <div onclick="openNotifComplaint('${n.complaintId}', '${n.firebaseDocId}')" class="p-3 hover:bg-slate-50 transition cursor-pointer ${n.read ? 'opacity-70' : 'bg-campus-50/50 font-medium'} flex gap-3 items-start">
+                    <div class="mt-0.5 text-campus-600">
+                        <i class="fa-solid ${n.priority === 'High' ? 'fa-triangle-exclamation text-red-500' : 'fa-circle-info'}"></i>
+                    </div>
+                    <div class="flex-1 min-w-0">
+                        <p class="text-xs font-bold text-slate-800">${n.title}</p>
+                        <p class="text-[11px] text-slate-600 truncate">${n.message}</p>
+                        <span class="text-[9px] text-slate-400 block mt-1">${new Date(n.createdAt).toLocaleTimeString([], {hour: '2-digit', minute:'2-digit'})}</span>
+                    </div>
+                </div>
+            `).join('');
+        }
+
+        function openNotifComplaint(complaintId, notifDocId) {
+            window.appState.markNotifRead(notifDocId);
+            toggleNotificationPanel();
+            window.appState.setTab('view');
+            setTimeout(() => highlightComplaintCard(complaintId), 300);
+        }
+
+        function openPrivacyModal() {
+            document.getElementById('privacyModal').classList.remove('hidden');
+        }
+
+        function closePrivacyModal() {
+            document.getElementById('privacyModal').classList.add('hidden');
+        }
+
+        function copyPrivacyUrl() {
+            const copyText = document.getElementById('privacyUrlText').innerText;
+            const textarea = document.createElement('textarea');
+            textarea.value = copyText;
+            document.body.appendChild(textarea);
+            textarea.select();
+            document.execCommand('copy');
+            document.body.removeChild(textarea);
+            showToast("Privacy Policy URL copied to clipboard!", "success");
+        }
+
+        function showToast(message, type = 'success') {
+            const container = document.getElementById('toastContainer');
+            const toast = document.createElement('div');
+            toast.className = `pointer-events-auto px-4 py-3 rounded-xl shadow-lg text-white text-sm font-medium flex items-center gap-3 fade-in ${
+                type === 'success' ? 'bg-campus-600' : 'bg-red-600'
+            }`;
+            toast.innerHTML = `
+                <i class="fa-solid ${type === 'success' ? 'fa-circle-check' : 'fa-circle-exclamation'} text-lg"></i>
+                <span>${message}</span>
+            `;
+            container.appendChild(toast);
+            setTimeout(() => {
+                toast.style.opacity = '0';
+                setTimeout(() => toast.remove(), 300);
+            }, 3500);
+        }
+
+        function openPhotoModal(url) {
+            document.getElementById('modalImageSrc').src = url;
+            document.getElementById('photoModal').classList.remove('hidden');
+        }
+
+        function closePhotoModal() {
+            document.getElementById('photoModal').classList.add('hidden');
+        }
+
+        function updateUIState() {
+            const tab = window.appState.getCurrentTab();
+            const reports = window.appState.getReports();
+            const container = document.getElementById('appView');
+
+            ['home', 'report', 'view', 'dashboard'].forEach(t => {
+                const btn = document.getElementById(`nav-${t}`);
+                if (btn) {
+                    if (t === tab) {
+                        btn.classList.add('text-campus-600', 'font-bold');
+                        btn.classList.remove('text-slate-600');
+                    } else {
+                        btn.classList.remove('text-campus-600', 'font-bold');
+                        btn.classList.add('text-slate-600');
+                    }
+                }
+            });
+
+            const adminLabel = document.getElementById('adminBtnLabel');
+            if (adminLabel) {
+                adminLabel.innerText = window.appState.isAdmin() ? 'Admin (Active)' : 'Admin';
+            }
+
+            if (tab === 'home') {
+                renderHome(reports, container);
+            } else if (tab === 'report') {
+                renderReportForm(container);
+            } else if (tab === 'view') {
+                renderViewReports(reports, container);
+            } else if (tab === 'dashboard') {
+                renderDashboard(reports, container);
+            }
+        }
+
+        function renderHome(reports, container) {
+            const total = reports.length;
+            const resolved = reports.filter(r => r.status === 'Resolved').length;
+            const inProgress = reports.filter(r => r.status === 'In Progress' || r.status === 'Under Review').length;
+
+            container.innerHTML = `
+                <div class="space-y-6">
+                    <!-- Hero Banner -->
+                    <div class="bg-gradient-to-br from-darkslate-900 via-darkslate-800 to-campus-900 rounded-3xl p-6 text-white shadow-xl relative overflow-hidden">
+                        <div class="absolute -right-6 -bottom-6 opacity-10 text-9xl">
+                            <i class="fa-solid fa-building-columns"></i>
+                        </div>
+                        <div class="relative z-10">
+                            <div class="flex items-center justify-between mb-3">
+                                <span class="bg-campus-500/20 text-campus-400 border border-campus-500/30 text-xs font-semibold px-3 py-1 rounded-full uppercase tracking-wider inline-block">
+                                    Civil Engineering Community App
+                                </span>
+                            </div>
+                            <h2 class="text-2xl sm:text-3xl font-bold mb-2">Welcome to CampusFix</h2>
+                            <p class="text-slate-300 text-sm sm:text-base mb-6 max-w-lg leading-relaxed">
+                                Report damaged infrastructure instantly. Syncs directly with live campus database.
+                            </p>
+                            <div class="flex flex-wrap gap-3">
+                                <button onclick="window.appState.setTab('report')" class="bg-campus-500 hover:bg-campus-600 text-white font-semibold px-5 py-3 rounded-xl shadow-lg flex items-center gap-2 transition transform active:scale-95">
+                                    <i class="fa-solid fa-circle-plus"></i> Report a Problem
+                                </button>
+                                <button onclick="window.appState.setTab('view')" class="bg-white/10 hover:bg-white/20 text-white font-medium px-5 py-3 rounded-xl backdrop-blur-sm border border-white/10 flex items-center gap-2 transition">
+                                    <i class="fa-solid fa-list-check"></i> View Reports (${total})
+                                </button>
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- Quick Stats Grid -->
+                    <div class="grid grid-cols-3 gap-3">
+                        <div class="bg-white p-4 rounded-2xl shadow-sm border border-slate-200 text-center">
+                            <span class="text-xs font-semibold text-slate-400 block mb-1">Total Reports</span>
+                            <span class="text-2xl font-bold text-slate-800">${total}</span>
+                        </div>
+                        <div class="bg-white p-4 rounded-2xl shadow-sm border border-slate-200 text-center">
+                            <span class="text-xs font-semibold text-amber-500 block mb-1">In Progress</span>
+                            <span class="text-2xl font-bold text-amber-600">${inProgress}</span>
+                        </div>
+                        <div class="bg-white p-4 rounded-2xl shadow-sm border border-slate-200 text-center">
+                            <span class="text-xs font-semibold text-campus-600 block mb-1">Resolved</span>
+                            <span class="text-2xl font-bold text-campus-600">${resolved}</span>
+                        </div>
+                    </div>
+
+                    <!-- Recent Reports Preview -->
+                    <div class="bg-white rounded-2xl p-5 shadow-sm border border-slate-200">
+                        <div class="flex justify-between items-center mb-4">
+                            <h3 class="font-bold text-slate-800 flex items-center gap-2">
+                                <i class="fa-solid fa-clock-rotate-left text-campus-600"></i> Recent Submissions
+                            </h3>
+                            <button onclick="window.appState.setTab('view')" class="text-xs font-semibold text-campus-600 hover:underline">View All</button>
+                        </div>
+                        <div class="space-y-3">
+                            ${reports.length === 0 ? `
+                                <div class="text-center py-8 text-slate-400">
+                                    <i class="fa-solid fa-clipboard-list text-3xl mb-2"></i>
+                                    <p class="text-sm">No reports submitted yet.</p>
+                                </div>
+                            ` : reports.slice(0, 3).map(r => `
+                                <div class="p-3 rounded-xl bg-slate-50 border border-slate-100 flex items-center justify-between gap-3">
+                                    <div class="flex items-center gap-3 min-w-0">
+                                        <div class="w-10 h-10 rounded-lg bg-campus-50 text-campus-600 flex items-center justify-center shrink-0">
+                                            <i class="fa-solid ${getCategoryIcon(r.category)}"></i>
+                                        </div>
+                                        <div class="min-w-0">
+                                            <h4 class="font-semibold text-sm text-slate-800 truncate">${r.category}</h4>
+                                            <p class="text-xs text-slate-500 truncate"><i class="fa-solid fa-location-dot text-campus-500 mr-1"></i>${r.location}</p>
+                                        </div>
+                                    </div>
+                                    <div class="shrink-0 text-right">
+                                        <span class="inline-block px-2.5 py-1 rounded-full text-xs font-semibold ${getStatusBadgeClass(r.status)}">
+                                            ${r.status}
+                                        </span>
+                                        <span class="block text-[10px] text-slate-400 mt-1">${r.id}</span>
+                                    </div>
+                                </div>
+                            `).join('')}
+                        </div>
+                    </div>
+                </div>
+            `;
+        }
+
+        function renderReportForm(container) {
+            container.innerHTML = `
+                <div class="bg-white rounded-3xl p-6 shadow-sm border border-slate-200">
+                    <div class="mb-6">
+                        <span class="bg-campus-50 text-campus-700 text-xs font-semibold px-3 py-1 rounded-full uppercase tracking-wider">New Issue</span>
+                        <h2 class="text-xl font-bold text-slate-800 mt-2">Report Campus Infrastructure Problem</h2>
+                        <p class="text-sm text-slate-500">Provide accurate details to help the maintenance team act quickly.</p>
+                    </div>
+
+                    <form id="problemForm" onsubmit="handleFormSubmit(event)" class="space-y-5">
+                        <div>
+                            <label class="block text-xs font-bold uppercase text-slate-600 mb-2">Problem Category *</label>
+                            <select id="reportCategory" required class="w-full bg-slate-50 border border-slate-200 rounded-xl px-4 py-3 text-sm font-medium text-slate-800 focus:outline-none focus:ring-2 focus:ring-campus-500">
+                                <option value="" disabled selected>Select category...</option>
+                                ${categories.map(c => `<option value="${c}">${c}</option>`).join('')}
+                            </select>
+                        </div>
+
+                        <div>
+                            <label class="block text-xs font-bold uppercase text-slate-600 mb-2">Exact Campus Location *</label>
+                            <div class="relative">
+                                <span class="absolute inset-y-0 left-0 flex items-center pl-4 text-slate-400">
+                                    <i class="fa-solid fa-location-dot"></i>
+                                </span>
+                                <input type="text" id="reportLocation" required placeholder="e.g. Mechanical Dept, Room 204" class="w-full bg-slate-50 border border-slate-200 rounded-xl pl-11 pr-4 py-3 text-sm text-slate-800 focus:outline-none focus:ring-2 focus:ring-campus-500">
+                            </div>
+                        </div>
+
+                        <div>
+                            <label class="block text-xs font-bold uppercase text-slate-600 mb-2">Priority Level *</label>
+                            <div class="grid grid-cols-3 gap-3">
+                                <label class="cursor-pointer">
+                                    <input type="radio" name="priority" value="Low" class="peer hidden" checked>
+                                    <div class="border border-slate-200 rounded-xl py-2.5 text-center text-sm font-semibold text-slate-600 peer-checked:bg-slate-100 peer-checked:border-slate-800 peer-checked:text-slate-900 transition">
+                                        Low
+                                    </div>
+                                </label>
+                                <label class="cursor-pointer">
+                                    <input type="radio" name="priority" value="Medium" class="peer hidden">
+                                    <div class="border border-slate-200 rounded-xl py-2.5 text-center text-sm font-semibold text-slate-600 peer-checked:bg-amber-50 peer-checked:border-amber-500 peer-checked:text-amber-700 transition">
+                                        Medium
+                                    </div>
+                                </label>
+                                <label class="cursor-pointer">
+                                    <input type="radio" name="priority" value="High" class="peer hidden">
+                                    <div class="border border-slate-200 rounded-xl py-2.5 text-center text-sm font-semibold text-slate-600 peer-checked:bg-red-50 peer-checked:border-red-500 peer-checked:text-red-700 transition">
+                                        High
+                                    </div>
+                                </label>
+                            </div>
+                        </div>
+
+                        <div>
+                            <label class="block text-xs font-bold uppercase text-slate-600 mb-2">Problem Description *</label>
+                            <textarea id="reportDesc" required rows="3" placeholder="Describe the issue in detail..." class="w-full bg-slate-50 border border-slate-200 rounded-xl p-4 text-sm text-slate-800 focus:outline-none focus:ring-2 focus:ring-campus-500"></textarea>
+                        </div>
+
+                        <div>
+                            <label class="block text-xs font-bold uppercase text-slate-600 mb-2">Upload Photograph</label>
+                            <div class="border-2 border-dashed border-slate-200 rounded-xl p-4 text-center bg-slate-50 hover:bg-slate-100/50 transition cursor-pointer" onclick="document.getElementById('fileInput').click()">
+                                <input type="file" id="fileInput" accept="image/*" class="hidden" onchange="handleFileSelect(event)">
+                                <div id="filePreviewContainer" class="flex flex-col items-center">
+                                    <i class="fa-solid fa-cloud-arrow-up text-2xl text-campus-600 mb-2"></i>
+                                    <p class="text-sm font-medium text-slate-700">Click to attach photo or camera capture</p>
+                                    <p class="text-xs text-slate-400 mt-1">PNG, JPG up to 5MB</p>
+                                </div>
+                            </div>
+                        </div>
+
+                        <button type="submit" id="submitBtn" class="w-full bg-campus-600 hover:bg-campus-700 text-white font-bold py-3.5 rounded-xl shadow-lg flex items-center justify-center gap-2 transition">
+                            <i class="fa-solid fa-paper-plane"></i> Submit Report
+                        </button>
+                    </form>
+                </div>
+            `;
+        }
+
+        let uploadedPhotoBase64 = "https://placehold.co/600x400/e2e8f0/475569?text=Campus+Issue+Photo";
+        function handleFileSelect(event) {
+            const file = event.target.files[0];
+            if (file) {
+                const reader = new FileReader();
+                reader.onload = function(e) {
+                    const img = new Image();
+                    img.onload = function() {
+                        const canvas = document.createElement('canvas');
+                        let width = img.width;
+                        let height = img.height;
+                        const maxDim = 1200;
+                        if (width > maxDim || height > maxDim) {
+                            if (width > height) {
+                                height = Math.round((height * maxDim) / width);
+                                width = maxDim;
+                            } else {
+                                width = Math.round((width * maxDim) / height);
+                                height = maxDim;
+                            }
+                        }
+                        canvas.width = width;
+                        canvas.height = height;
+                        const ctx = canvas.getContext('2d');
+                        ctx.drawImage(img, 0, 0, width, height);
+                        uploadedPhotoBase64 = canvas.toDataURL('image/jpeg', 0.7);
+
+                        document.getElementById('filePreviewContainer').innerHTML = `
+                            <div class="flex items-center gap-3">
+                                <img src="${uploadedPhotoBase64}" class="w-16 h-16 object-cover rounded-lg border">
+                                <div class="text-left">
+                                    <p class="text-sm font-semibold text-slate-800">${file.name}</p>
+                                    <p class="text-xs text-campus-600 font-medium">Photo optimized & ready (${Math.round(uploadedPhotoBase64.length/1024)} KB)</p>
+                                </div>
+                            </div>
+                        `;
+                    };
+                    img.src = e.target.result;
+                };
+                reader.readAsDataURL(file);
+            }
+        }
+
+        async function handleFormSubmit(e) {
+            e.preventDefault();
+            const category = document.getElementById('reportCategory').value;
+            const location = document.getElementById('reportLocation').value;
+            const description = document.getElementById('reportDesc').value;
+            const priority = document.querySelector('input[name="priority"]:checked').value;
+
+            const btn = document.getElementById('submitBtn');
+            btn.disabled = true;
+            btn.innerHTML = `<i class="fa-solid fa-spinner animate-spin"></i> Submitting...`;
+
+            const success = await window.appState.submitReport({
+                category,
+                location,
+                description,
+                priority,
+                photo: uploadedPhotoBase64
+            });
+
+            if (success) {
+                window.appState.setTab('view');
+            } else {
+                btn.disabled = false;
+                btn.innerHTML = `<i class="fa-solid fa-paper-plane"></i> Submit Report`;
+            }
+        }
+
+        function renderViewReports(reports, container) {
+            container.innerHTML = `
+                <div class="space-y-4">
+                    <div class="flex flex-col sm:flex-row justify-between items-start sm:items-center gap-3 bg-white p-4 rounded-2xl shadow-sm border border-slate-200">
+                        <div>
+                            <h2 class="font-bold text-slate-800 text-lg">All Campus Reports</h2>
+                            <p class="text-xs text-slate-500">Track status and review submitted issues</p>
+                        </div>
+                        <div class="w-full sm:w-auto flex gap-2">
+                            <select id="filterCategory" onchange="filterReportsList()" class="bg-slate-50 border border-slate-200 rounded-xl px-3 py-2 text-xs font-medium text-slate-700 focus:outline-none">
+                                <option value="">All Categories</option>
+                                ${categories.map(c => `<option value="${c}">${c}</option>`).join('')}
+                            </select>
+                            <select id="filterStatus" onchange="filterReportsList()" class="bg-slate-50 border border-slate-200 rounded-xl px-3 py-2 text-xs font-medium text-slate-700 focus:outline-none">
+                                <option value="">All Statuses</option>
+                                <option value="Reported">Reported</option>
+                                <option value="Under Review">Under Review</option>
+                                <option value="In Progress">In Progress</option>
+                                <option value="Resolved">Resolved</option>
+                            </select>
+                        </div>
+                    </div>
+
+                    <div id="reportsListContainer" class="space-y-4"></div>
+                </div>
+            `;
+            renderReportsCards(reports);
+        }
+
+        function filterReportsList() {
+            const catFilter = document.getElementById('filterCategory').value;
+            const statusFilter = document.getElementById('filterStatus').value;
+            const reports = window.appState.getReports();
+
+            const filtered = reports.filter(r => {
+                let matchCat = !catFilter || r.category === catFilter;
+                let matchStatus = !statusFilter || r.status === statusFilter;
+                return matchCat && matchStatus;
+            });
+
+            renderReportsCards(filtered);
+        }
+
+        function renderReportsCards(reports) {
+            const listContainer = document.getElementById('reportsListContainer');
+            if (!listContainer) return;
+
+            if (reports.length === 0) {
+                listContainer.innerHTML = `
+                    <div class="bg-white rounded-2xl p-12 text-center border border-slate-200">
+                        <i class="fa-solid fa-folder-open text-4xl text-slate-300 mb-3"></i>
+                        <p class="text-slate-600 font-medium">No reports found matching criteria.</p>
+                    </div>
+                `;
+                return;
+            }
+
+            const isAdmin = window.appState.isAdmin();
+
+            listContainer.innerHTML = reports.map(r => `
+                <div id="card-${r.id}" class="bg-white rounded-2xl p-5 shadow-sm border border-slate-200 hover:shadow-md transition">
+                    <div class="flex items-start justify-between gap-3 mb-3">
+                        <div class="flex items-center gap-3">
+                            <div class="w-12 h-12 rounded-xl bg-campus-50 text-campus-600 flex items-center justify-center shrink-0 text-lg">
+                                <i class="fa-solid ${getCategoryIcon(r.category)}"></i>
+                            </div>
+                            <div>
+                                <span class="text-xs font-bold text-campus-700 bg-campus-50 px-2.5 py-0.5 rounded-md">${r.id}</span>
+                                <h3 class="font-bold text-slate-800 text-base mt-1">${r.category}</h3>
+                            </div>
+                        </div>
+                        <span class="px-3 py-1 rounded-full text-xs font-bold ${getStatusBadgeClass(r.status)}">
+                            ${r.status}
+                        </span>
+                    </div>
+
+                    <p class="text-sm text-slate-600 mb-4 leading-relaxed">${r.description}</p>
+
+                    <div class="grid grid-cols-1 sm:grid-cols-2 gap-3 mb-4">
+                        <div class="text-xs text-slate-500 flex items-center gap-2 bg-slate-50 p-2.5 rounded-xl border border-slate-100">
+                            <i class="fa-solid fa-location-dot text-campus-600"></i>
+                            <span class="font-medium text-slate-700 truncate">${r.location}</span>
+                        </div>
+                        <div class="text-xs text-slate-500 flex items-center gap-2 bg-slate-50 p-2.5 rounded-xl border border-slate-100">
+                            <i class="fa-solid fa-flag text-amber-500"></i>
+                            <span>Priority: <strong class="text-slate-700">${r.priority || 'Normal'}</strong></span>
+                        </div>
+                    </div>
+
+                    ${r.photo ? `
+                        <div class="mb-4">
+                            <img src="${r.photo}" alt="Issue photo" class="w-full h-48 object-cover rounded-xl border border-slate-200 cursor-pointer" onclick="openPhotoModal('${r.photo}')">
+                        </div>
+                    ` : ''}
+
+                    <div class="flex items-center justify-between pt-3 border-t border-slate-100 text-xs text-slate-400">
+                        <span><i class="fa-regular fa-calendar mr-1"></i> ${new Date(r.createdAt || Date.now()).toLocaleDateString()}</span>
+                        
+                        ${isAdmin ? `
+                            <div class="flex items-center gap-2">
+                                <select onchange="window.appState.updateStatus('${r.id}', this.value)" class="bg-slate-100 border border-slate-200 rounded-lg px-2 py-1 text-xs font-semibold text-slate-700 focus:outline-none">
+                                    <option value="" disabled selected>Change Status...</option>
+                                    <option value="Reported">Reported</option>
+                                    <option value="Under Review">Under Review</option>
+                                    <option value="In Progress">In Progress</option>
+                                    <option value="Resolved">Resolved</option>
+                                </select>
+                                <button onclick="window.appState.deleteReport('${r.id}')" class="text-red-500 hover:text-red-700 p-1.5 rounded-lg bg-red-50 transition" title="Delete report">
+                                    <i class="fa-solid fa-trash"></i>
+                                </button>
+                            </div>
+                        ` : `
+                            <span class="text-campus-600 font-medium">Community Verified</span>
+                        `}
+                    </div>
+                </div>
+            `).join('');
+        }
+
+        function renderDashboard(reports, container) {
+            const total = reports.length;
+            const reported = reports.filter(r => r.status === 'Reported').length;
+            const underReview = reports.filter(r => r.status === 'Under Review').length;
+            const inProgress = reports.filter(r => r.status === 'In Progress').length;
+            const resolved = reports.filter(r => r.status === 'Resolved').length;
+
+            const categoryCounts = {};
+            categories.forEach(c => categoryCounts[c] = 0);
+            reports.forEach(r => {
+                if (categoryCounts[r.category] !== undefined) {
+                    categoryCounts[r.category]++;
+                } else {
+                    categoryCounts['Other problems'] = (categoryCounts['Other problems'] || 0) + 1;
+                }
+            });
+
+            container.innerHTML = `
+                <div class="space-y-6">
+                    <div class="bg-white rounded-3xl p-6 shadow-sm border border-slate-200">
+                        <span class="bg-campus-50 text-campus-700 text-xs font-semibold px-3 py-1 rounded-full uppercase tracking-wider">Analytics</span>
+                        <h2 class="text-xl font-bold text-slate-800 mt-2">Campus Infrastructure Dashboard</h2>
+                        <p class="text-sm text-slate-500">Statistical overview of civil issues reported across the campus.</p>
+                    </div>
+
+                    <div class="grid grid-cols-2 sm:grid-cols-4 gap-3">
+                        <div class="bg-white p-4 rounded-2xl border border-slate-200 shadow-sm">
+                            <span class="text-xs font-bold text-slate-400 block mb-1">Reported</span>
+                            <span class="text-2xl font-bold text-slate-800">${reported}</span>
+                        </div>
+                        <div class="bg-white p-4 rounded-2xl border border-slate-200 shadow-sm">
+                            <span class="text-xs font-bold text-blue-500 block mb-1">Under Review</span>
+                            <span class="text-2xl font-bold text-blue-600">${underReview}</span>
+                        </div>
+                        <div class="bg-white p-4 rounded-2xl border border-slate-200 shadow-sm">
+                            <span class="text-xs font-bold text-amber-500 block mb-1">In Progress</span>
+                            <span class="text-2xl font-bold text-amber-600">${inProgress}</span>
+                        </div>
+                        <div class="bg-white p-4 rounded-2xl border border-slate-200 shadow-sm">
+                            <span class="text-xs font-bold text-campus-600 block mb-1">Resolved</span>
+                            <span class="text-2xl font-bold text-campus-600">${resolved}</span>
+                        </div>
+                    </div>
+
+                    <div class="bg-white rounded-3xl p-6 shadow-sm border border-slate-200">
+                        <h3 class="font-bold text-slate-800 mb-4 flex items-center gap-2">
+                            <i class="fa-solid fa-chart-bar text-campus-600"></i> Issues by Category
+                        </h3>
+                        <div class="space-y-3">
+                            ${categories.map(cat => {
+                                const count = categoryCounts[cat] || 0;
+                                const percent = total > 0 ? Math.round((count / total) * 100) : 0;
+                                return `
+                                    <div>
+                                        <div class="flex justify-between items-center text-xs font-semibold text-slate-700 mb-1">
+                                            <span>${cat}</span>
+                                            <span>${count} (${percent}%)</span>
+                                        </div>
+                                        <div class="w-full bg-slate-100 h-2.5 rounded-full overflow-hidden">
+                                            <div class="bg-campus-500 h-full rounded-full transition-all duration-500" style="width: ${percent}%"></div>
+                                        </div>
+                                    </div>
+                                `;
+                            }).join('')}
+                        </div>
+                    </div>
+                </div>
+            `;
+        }
+
+        function openAdminModal() {
+            const modal = document.getElementById('adminModal');
+            const body = document.getElementById('adminModalBody');
+            modal.classList.remove('hidden');
+
+            const isAdmin = window.appState.isAdmin();
+            const prefs = window.appState.getAdminPrefs();
+
+            if (isAdmin) {
+                body.innerHTML = `
+                    <div class="space-y-4">
+                        <div class="bg-campus-50 border border-campus-200 text-campus-800 p-4 rounded-xl text-sm font-medium flex items-center gap-3">
+                            <i class="fa-solid fa-shield-check text-2xl text-campus-600"></i>
+                            <div>
+                                <p class="font-bold text-base">Admin Session Active</p>
+                                <p class="text-xs text-campus-700 mt-0.5">Full administrator privileges & background FCM enabled.</p>
+                            </div>
+                        </div>
+
+                        <!-- Notification Preferences Settings -->
+                        <div class="bg-slate-50 p-4 rounded-xl border border-slate-200 space-y-3">
+                            <h4 class="font-bold text-xs uppercase text-slate-600 tracking-wider">Push Notification Preferences</h4>
+                            
+                            <label class="flex items-center justify-between text-xs text-slate-700 font-medium cursor-pointer">
+                                <span>New Complaints Alert</span>
+                                <input type="checkbox" onchange="togglePref('newComplaints', this.checked)" ${prefs.newComplaints ? 'checked' : ''} class="w-4 h-4 text-campus-600 rounded focus:ring-campus-500">
+                            </label>
+
+                            <label class="flex items-center justify-between text-xs text-slate-700 font-medium cursor-pointer">
+                                <span>Urgent & High Priority Alerts</span>
+                                <input type="checkbox" onchange="togglePref('urgentComplaints', this.checked)" ${prefs.urgentComplaints ? 'checked' : ''} class="w-4 h-4 text-campus-600 rounded focus:ring-campus-500">
+                            </label>
+
+                            <label class="flex items-center justify-between text-xs text-slate-700 font-medium cursor-pointer">
+                                <span>Unresolved Escalations (24h+)</span>
+                                <input type="checkbox" onchange="togglePref('unresolvedComplaints', this.checked)" ${prefs.unresolvedComplaints ? 'checked' : ''} class="w-4 h-4 text-campus-600 rounded focus:ring-campus-500">
+                            </label>
+                            <div class="pt-2 border-t border-slate-200 flex gap-2">
+                                <button type="button" onclick="window.requestWebPushPermission()" class="flex-1 bg-campus-600 hover:bg-campus-700 text-white text-xs font-semibold py-2 px-3 rounded-lg transition flex items-center justify-center gap-1.5">
+                                    <i class="fa-solid fa-bell"></i> Enable Browser Push
+                                </button>
+                                <button type="button" onclick="window.showBrowserNotification('🔔 Admin Test Alert', 'Push notifications and audio chime are operational!')" class="flex-1 bg-slate-200 hover:bg-slate-300 text-slate-800 text-xs font-semibold py-2 px-3 rounded-lg transition flex items-center justify-center gap-1.5">
+                                    <i class="fa-solid fa-volume-high"></i> Test Alert
+                                </button>
+                            </div>
+                        </div>
+
+                        <button onclick="logoutAdmin()" class="w-full bg-red-600 hover:bg-red-700 text-white font-bold py-3 rounded-xl shadow-md transition flex items-center justify-center gap-2">
+                            <i class="fa-solid fa-right-from-bracket"></i> Log Out Admin Mode
+                        </button>
+                    </div>
+                `;
+            } else {
+                body.innerHTML = `
+                    <div class="space-y-4">
+                        <p class="text-sm text-slate-600 leading-relaxed">Enter your passcode to authorize your session.</p>
+
+                        <form onsubmit="handleAdminLogin(event)" class="space-y-4">
+                            <div>
+                                <label class="block text-xs font-bold uppercase text-slate-600 mb-2">Admin Passcode</label>
+                                <div class="relative">
+                                    <input type="password" id="adminPassInput" required placeholder="Enter secret passcode" class="w-full bg-slate-50 border border-slate-200 rounded-xl px-4 py-3 pr-10 text-sm text-slate-800 focus:outline-none focus:ring-2 focus:ring-campus-500">
+                                    <button type="button" onclick="togglePassVisibility()" class="absolute inset-y-0 right-0 pr-3 flex items-center text-slate-400 hover:text-slate-600" title="Toggle visibility">
+                                        <i class="fa-solid fa-eye" id="passEyeIcon"></i>
+                                    </button>
+                                </div>
+                            </div>
+                            <button type="submit" class="w-full bg-darkslate-900 hover:bg-darkslate-800 text-white font-bold py-3.5 rounded-xl shadow-md transition flex items-center justify-center gap-2 text-sm">
+                                <i class="fa-solid fa-lock-open"></i> Authenticate
+                            </button>
+                        </form>
+                    </div>
+                `;
+            }
+        }
+
+        function togglePassVisibility() {
+            const input = document.getElementById('adminPassInput');
+            const icon = document.getElementById('passEyeIcon');
+            if (!input) return;
+            if (input.type === 'password') {
+                input.type = 'text';
+                if (icon) { icon.classList.remove('fa-eye'); icon.classList.add('fa-eye-slash'); }
+            } else {
+                input.type = 'password';
+                if (icon) { icon.classList.remove('fa-eye-slash'); icon.classList.add('fa-eye'); }
+            }
+        }
+
+        function togglePref(key, value) {
+            window.appState.updateAdminPrefs({ [key]: value });
+        }
+
+        function closeAdminModal() {
+            document.getElementById('adminModal').classList.add('hidden');
+        }
+
+        function handleAdminLogin(e) {
+            e.preventDefault();
+            const input = document.getElementById('adminPassInput');
+            const val = input ? input.value.trim().toUpperCase() : '';
+            if (val === 'S0309') {
+                window.appState.setAdmin(true);
+                closeAdminModal();
+                showToast("Admin access granted successfully!", "success");
+            } else {
+                showToast("Incorrect passcode. Please try again.", "error");
+            }
+        }
+
+        function logoutAdmin() {
+            window.appState.setAdmin(false);
+            closeAdminModal();
+            showToast("Logged out of admin mode.", "success");
+        }
+
+        function getCategoryIcon(cat) {
+            switch(cat) {
+                case 'Damaged roads and pathways': return 'fa-road';
+                case 'Water leakage': return 'fa-droplet';
+                case 'Blocked drainage': return 'fa-water';
+                case 'Rainwater waterlogging': return 'fa-cloud-showers-heavy';
+                case 'Overflowing dustbins': return 'fa-trash-can';
+                case 'Broken lights': return 'fa-lightbulb';
+                case 'Damaged walls and buildings': return 'fa-house-crack';
+                case 'Washroom maintenance': return 'fa-restroom';
+                default: return 'fa-triangle-exclamation';
+            }
+        }
+
+        function getStatusBadgeClass(status) {
+            switch(status) {
+                case 'Reported': return 'bg-slate-100 text-slate-700 border border-slate-200';
+                case 'Under Review': return 'bg-blue-50 text-blue-700 border border-blue-200';
+                case 'In Progress': return 'bg-amber-50 text-amber-700 border border-amber-200';
+                case 'Resolved': return 'bg-campus-50 text-campus-700 border border-campus-200';
+                default: return 'bg-slate-100 text-slate-700';
+            }
+        }
+
+        window.onload = function() {
+            updateUIState();
+        };
+    </script>
+</body>
+</html>
